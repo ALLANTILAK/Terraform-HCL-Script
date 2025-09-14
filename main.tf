@@ -28,13 +28,30 @@ variable "ami_id" {
   default     = "ami-0c55b159cbfafe1f0" # Replace with a valid AMI for your region
 }
 
+variable "rds_read_replica_count" {
+  description = "Number of RDS read replicas"
+  type        = number
+  default     = 2
+}
+
+variable "rds_backup_retention_period" {
+  description = "RDS backup retention period in days"
+  type        = number
+  default     = 7
+}
+
+variable "redis_snapshot_retention_limit" {
+  description = "Number of Redis snapshots to retain"
+  type        = number
+  default     = 5
+}
+
 # Security Group for Proxy and Frontend Servers
 resource "aws_security_group" "proxy_frontend_sg" {
   name        = "proxy-frontend-sg"
   description = "Security group for proxy and frontend servers"
   vpc_id      = var.vpc_id
 
-  # SSH (port 22) from specific IP
   ingress {
     from_port   = 22
     to_port     = 22
@@ -42,7 +59,6 @@ resource "aws_security_group" "proxy_frontend_sg" {
     cidr_blocks = ["192.168.1.78/32"]
   }
 
-  # HTTP (port 80) from anywhere
   ingress {
     from_port   = 80
     to_port     = 80
@@ -50,7 +66,6 @@ resource "aws_security_group" "proxy_frontend_sg" {
     cidr_blocks = ["0.0.0.0/0"]
   }
 
-  # HTTPS (port 443) from anywhere
   ingress {
     from_port   = 443
     to_port     = 443
@@ -58,7 +73,6 @@ resource "aws_security_group" "proxy_frontend_sg" {
     cidr_blocks = ["0.0.0.0/0"]
   }
 
-  # Allow all outbound traffic
   egress {
     from_port   = 0
     to_port     = 0
@@ -73,7 +87,6 @@ resource "aws_security_group" "rds_sg" {
   description = "Security group for RDS instance"
   vpc_id      = var.vpc_id
 
-  # MySQL (port 3306) from proxy and frontend servers
   ingress {
     from_port       = 3306
     to_port         = 3306
@@ -88,12 +101,23 @@ resource "aws_security_group" "redis_sg" {
   description = "Security group for Redis instance"
   vpc_id      = var.vpc_id
 
-  # Redis (port 6379) from proxy and frontend servers
   ingress {
     from_port       = 6379
     to_port         = 6379
     protocol        = "tcp"
     security_groups = [aws_security_group.proxy_frontend_sg.id]
+  }
+}
+
+# Elastic IP for Proxy Server
+resource "aws_eip" "proxy_eip" {
+  vpc = true
+  tags = {
+    Name = "proxy-eip"
+  }
+
+  lifecycle {
+    prevent_destroy = true # Prevents accidental deletion of the EIP
   }
 }
 
@@ -109,6 +133,12 @@ resource "aws_instance" "proxy" {
   }
 }
 
+# Associate Elastic IP with Proxy Instance
+resource "aws_eip_association" "proxy_eip_assoc" {
+  instance_id   = aws_instance.proxy.id
+  allocation_id = aws_eip.proxy_eip.id
+}
+
 # Frontend EC2 Instances
 resource "aws_instance" "frontend" {
   count         = 2
@@ -122,48 +152,75 @@ resource "aws_instance" "frontend" {
   }
 }
 
-# RDS Instance (MySQL)
-resource "aws_db_instance" "rds" {
-  identifier           = "my-rds-instance"
-  engine               = "mysql"
-  engine_version       = "8.0"
-  instance_class       = "db.t3.micro"
-  allocated_storage    = 20
-  storage_type        = "gp2"
-  username             = "admin"
-  password             = "securepassword123" # Use a secret manager in production
-  vpc_security_group_ids = [aws_security_group.rds_sg.id]
-  db_subnet_group_name = aws_db_subnet_group.rds_subnet_group.name
-  skip_final_snapshot  = true
-}
-
 # RDS Subnet Group
 resource "aws_db_subnet_group" "rds_subnet_group" {
   name       = "rds-subnet-group"
   subnet_ids = var.subnet_ids
 }
 
-# ElastiCache Redis Instance
-resource "aws_elasticache_cluster" "redis" {
-  cluster_id           = "my-redis-cluster"
-  engine               = "redis"
-  node_type            = "cache.t3.micro"
-  num_cache_nodes      = 1
-  parameter_group_name = "default.redis6.x"
-  subnet_group_name    = aws_elasticache_subnet_group.redis_subnet_group.name
-  security_group_ids   = [aws_security_group.redis_sg.id]
+# RDS Primary Instance (MySQL)
+resource "aws_db_instance" "rds" {
+  identifier                = "my-rds-instance"
+  engine                    = "mysql"
+  engine_version            = "8.0"
+  instance_class            = "db.t3.micro"
+  allocated_storage         = 20
+  storage_type              = "gp2"
+  username                  = "admin"
+  password                  = "securepassword123" # Use a secret manager in production
+  vpc_security_group_ids    = [aws_security_group.rds_sg.id]
+  db_subnet_group_name      = aws_db_subnet_group.rds_subnet_group.name
+  backup_retention_period   = var.rds_backup_retention_period
+  final_snapshot_identifier = "my-rds-final-snapshot-${timestamp()}"
+  skip_final_snapshot       = false
+
+  lifecycle {
+    prevent_destroy = true # Prevents accidental deletion of the RDS instance
+  }
 }
 
-# Redis Subnet Group
+# RDS Read Replicas
+resource "aws_db_instance" "rds_read_replica" {
+  count               = var.rds_read_replica_count
+  identifier          = "my-rds-replica-${count.index + 1}"
+  instance_class      = "db.t3.micro"
+  replicate_source_db = aws_db_instance.rds.identifier
+  vpc_security_group_ids = [aws_security_group.rds_sg.id]
+  skip_final_snapshot = false
+  final_snapshot_identifier = "my-rds-replica-${count.index + 1}-final-snapshot-${timestamp()}"
+
+  lifecycle {
+    prevent_destroy = true # Prevents accidental deletion of read replicas
+  }
+}
+
+# ElastiCache Subnet Group
 resource "aws_elasticache_subnet_group" "redis_subnet_group" {
   name       = "redis-subnet-group"
   subnet_ids = var.subnet_ids
 }
 
+# ElastiCache Redis Instance
+resource "aws_elasticache_cluster" "redis" {
+  cluster_id               = "my-redis-cluster"
+  engine                   = "redis"
+  node_type                = "cache.t3.micro"
+  num_cache_nodes          = 1
+  parameter_group_name     = "default.redis6.x"
+  subnet_group_name        = aws_elasticache_subnet_group.redis_subnet_group.name
+  security_group_ids       = [aws_security_group.redis_sg.id]
+  snapshot_retention_limit = var.redis_snapshot_retention_limit
+  snapshot_name            = "my-redis-snapshot"
+
+  lifecycle {
+    prevent_destroy = true # Prevents accidental deletion of the Redis cluster
+  }
+}
+
 # Outputs
-output "proxy_public_ip" {
-  description = "Public IP of the proxy server"
-  value       = aws_instance.proxy.public_ip
+output "proxy_eip" {
+  description = "Elastic IP of the proxy server"
+  value       = aws_eip.proxy_eip.public_ip
 }
 
 output "frontend_public_ips" {
@@ -172,11 +229,26 @@ output "frontend_public_ips" {
 }
 
 output "rds_endpoint" {
-  description = "RDS instance endpoint"
+  description = "RDS primary instance endpoint"
   value       = aws_db_instance.rds.endpoint
+}
+
+output "rds_replica_endpoints" {
+  description = "RDS read replica endpoints"
+  value       = aws_db_instance.rds_read_replica[*].endpoint
 }
 
 output "redis_endpoint" {
   description = "Redis instance endpoint"
   value       = aws_elasticache_cluster.redis.cache_nodes[0].address
+}
+
+output "rds_final_snapshot" {
+  description = "RDS final snapshot identifier"
+  value       = aws_db_instance.rds.final_snapshot_identifier
+}
+
+output "redis_snapshot_name" {
+  description = "Redis snapshot name"
+  value       = aws_elasticache_cluster.redis.snapshot_name
 }
